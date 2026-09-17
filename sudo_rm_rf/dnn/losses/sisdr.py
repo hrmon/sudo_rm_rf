@@ -570,7 +570,9 @@ class StabilizedPermInvSISDRMetric(nn.Module):
         sisnr_l, best_perm_ind = self.compute_sisnr(
             pr_batch, t_batch, eps=eps)
         if return_best_permutation:
-            best_permutations = self.permutations_tensor[best_perm_ind]
+            best_permutations = \
+                self.permutations_tensor.to(pr_batch.device)[
+                    best_perm_ind]
             return sisnr_l, best_permutations
         else:
             return sisnr_l
