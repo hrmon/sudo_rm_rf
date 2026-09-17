@@ -99,7 +99,8 @@ class VariableSpeakerSNRwithZeroRefs(nn.Module):
         all_snrs = torch.stack(all_snrs, -1)  # B x 1 x n_perm
         best_snr, best_perm_ind = torch.max(all_snrs, -1)
 
-        best_perm = self.permutations_tensor[best_perm_ind]
+        perm_tensor = self.permutations_tensor.to(pr_batch.device)
+        best_perm = perm_tensor[best_perm_ind]
 
         # ---- inactive outputs penalty under the best permutation ----
         # rows of the estimates matched to inactive (zero) targets
