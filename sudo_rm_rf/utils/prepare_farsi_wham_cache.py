@@ -9,8 +9,12 @@ Each clip is resampled to 16 kHz float32 and written to:
     <speech_out>/speech/<speaker_id>/<idx>.wav
 
 Noise cache is built from the HuggingFace dataset
-montaseri/wham-noise-subset-sharded, whose `label` column carries the
-original WHAM split (0=cv, 1=tr, 2=tt). Clips are resampled to 16 kHz and
+montaseri/wham-noise-subset-sharded. Attention: the per-row `label`
+column (0=cv, 1=tr, 2=tt) is populated only in its `eval` (all cv) and
+`test` (all tt) splits and is null in the HF `train` split, which only
+contains original WHAM `tr` noise. So the WHAM split is derived from the
+row label when present, otherwise from the HF split name:
+train -> tr, eval -> cv, test -> tt. Clips are resampled to 16 kHz and
 written to:
 
     <noise_out>/<tr|cv|tt>/<idx>.wav
@@ -131,43 +135,62 @@ def prepare_noise(cache_root, fs, n_jobs, cache_dir=None):
         print('noise_index.json already exists, skipping noise cache.')
         return
 
-    ds_kwargs = dict()
-    if cache_dir is not None:
-        ds_kwargs['cache_dir'] = cache_dir
-    # Keep original WHAM splits: labels 0=cv, 1=tr, 2=tt
-    ds = datasets.load_dataset('montaseri/wham-noise-subset-sharded',
-                               split='train', **ds_kwargs)
-    label_map = {0: 'cv', 1: 'tr', 2: 'tt'}
-
-    index = {k: [] for k in label_map.values()}
-    # filenames are assigned in the main thread (decode runs on workers,
-    # so counting inside decode could collide on the same idx filename)
+    index = {k: [] for k in ('tr', 'cv', 'tt')}
+    # Filenames are assigned in the main thread (decode runs on workers,
+    # so counting/starting inside decode could collide on the same idx
+    # filename).
     with ThreadPoolExecutor(max_workers=n_jobs) as pool_w:
-        def decode(example):
-            audio = example['audio']
-            wav, fs_orig = audio['array'], audio['sampling_rate']
-            if wav.ndim > 1:
-                wav = wav.mean(-1)
-            wav = resample_to(wav.astype(np.float32), fs_orig, fs)
-            split = label_map[int(example['label'])]
-            if np.mean(wav ** 2) < 1e-10:
-                return None
-            return split, wav
+        for hf_split in ('train', 'eval', 'test'):
+            ds_kwargs = dict()
+            if cache_dir is not None:
+                ds_kwargs['cache_dir'] = cache_dir
+            # Keep original WHAM splits: the per-row `label` column
+            # (0=cv, 1=tr, 2=tt) exists in eval \& test but is null in
+            # the HF `train` split (which is all original WHAM `tr`
+            # noise anyway). Fall back to the HF split name when label
+            # is missing. HF split -> WHAM split:
+            #   train -> tr, eval -> cv, test -> tt
+            ds = datasets.load_dataset(
+                'montaseri/wham-noise-subset-sharded',
+                split=hf_split, **ds_kwargs)
+            label_map = {0: 'cv', 1: 'tr', 2: 'tt'}
 
-        results = (r for r in pool_w.map(decode, ds)
-                   if r is not None)
-        pbar = tqdm(results, total=len(ds), unit='clip',
-                    desc='Caching noise (resampling to {}Hz)'.format(fs))
-        for split, wav in pbar:
-            split_dir = os.path.join(cache_root, split)
-            os.makedirs(split_dir, exist_ok=True)
-            idx = len(index[split])
-            out_path = os.path.join(split_dir, '{}.wav'.format(
-                str(idx).zfill(6)))
-            pool_w.submit(write_wav_pair, (out_path, wav, fs))
-            index[split].append(os.path.abspath(out_path))
-            pbar.set_postfix(tr=len(index['tr']), cv=len(index['cv']),
-                             tt=len(index['tt']))
+            def decode(example, hf_split=hf_split):
+                audio = example['audio']
+                wav, fs_orig = audio['array'], audio['sampling_rate']
+                if wav.ndim > 1:
+                    wav = wav.mean(-1)
+                wav = resample_to(wav.astype(np.float32), fs_orig, fs)
+                if np.mean(wav ** 2) < 1e-10:
+                    return None
+                label = example.get('label', None)
+                if label is not None:
+                    split = label_map[int(label)]
+                else:
+                    split = {'train': 'tr', 'eval': 'cv',
+                             'test': 'tt'}[hf_split]
+                return split, wav
+
+            results = (r for r in pool_w.map(decode, ds)
+                       if r is not None)
+            pbar = tqdm(results, total=len(ds), unit='clip',
+                        desc='Caching noise [{}] (resampling to {}Hz)'
+                             ''.format(hf_split, fs))
+            for split, wav in pbar:
+                split_dir = os.path.join(cache_root, split)
+                os.makedirs(split_dir, exist_ok=True)
+                idx = len(index[split])
+                out_path = os.path.join(split_dir, '{}.wav'.format(
+                    str(idx).zfill(6)))
+                pool_w.submit(write_wav_pair, (out_path, wav, fs))
+                index[split].append(os.path.abspath(out_path))
+                pbar.set_postfix(tr=len(index['tr']), cv=len(index['cv']),
+                                 tt=len(index['tt']))
+
+    with open(os.path.join(cache_root, 'noise_index.json'), 'w') as f:
+        json.dump({'fs': fs, 'splits': index}, f)
+    print('Noise cache done: ' + ', '.join(
+        '{}: {}'.format(k, len(v)) for k, v in index.items()))
 
     with open(os.path.join(cache_root, 'noise_index.json'), 'w') as f:
         json.dump({'fs': fs, 'splits': index}, f)
