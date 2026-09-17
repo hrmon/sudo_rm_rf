@@ -284,7 +284,9 @@ for i in range(start_epoch, hparams['n_epochs']):
                                            hparams['clip_grad_norm'])
 
         opt.step()
-        sum_loss += l.detach().item()
+        l_val = l.detach().item()
+        sum_loss += l_val
+        res_dic[back_loss_tr_loss_name]['acc'].append(l_val)
         train_tqdm_gen.set_description(
             "Training, Running Avg Loss: {}".format(sum_loss / (cnt + 1)))
 
