@@ -17,15 +17,15 @@ def get_args():
     parser.add_argument("--train", type=str, nargs='+',
                         help="Training dataset",
                         default=None,
-                        choices=['WHAM', 'LIBRI2MIX', 'MUSDB', 'FUSS', 'WHAMR'])
+                        choices=['WHAM', 'LIBRI2MIX', 'MUSDB', 'FUSS', 'WHAMR', 'FARSI_WHAM'])
     parser.add_argument("--val", type=str, nargs='+',
                         help="Validation dataset",
                         default=None,
-                        choices=['WHAM', 'LIBRI2MIX', 'MUSDB', 'FUSS', 'WHAMR'])
+                        choices=['WHAM', 'LIBRI2MIX', 'MUSDB', 'FUSS', 'WHAMR', 'FARSI_WHAM'])
     parser.add_argument("--test", type=str, nargs='+',
                         help="Test dataset",
                         default=None,
-                        choices=['WHAM', 'LIBRI2MIX', 'MUSDB', 'FUSS', 'WHAMR'])
+                        choices=['WHAM', 'LIBRI2MIX', 'MUSDB', 'FUSS', 'WHAMR', 'FARSI_WHAM'])
     parser.add_argument("--train_val", type=str, nargs='+',
                         help="Validation on the training data",
                         default=None,

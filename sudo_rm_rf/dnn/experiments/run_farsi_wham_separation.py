@@ -1,9 +1,19 @@
 """!
-@brief Running an experiment with the improved version of SuDoRmRf on
-universal source separation with multiple sources.
+@brief Training/validation of GroupComm SuDoRmRf for up-to-3-speaker
+Farsi speech separation with optional WHAM noise interference.
 
-@author Efthymios Tzinis {etzinis2@illinois.edu}
-@copyright University of Illinois at Urbana-Champaign
+Based on run_fuss_separation.py but adapted for the FARSI_WHAM dataset:
+- The dataset loader returns dict batches with the noisy mixture and
+  three speech targets (zero rows for missing speakers).
+- No online source reshuffling/level augmentation (the loader controls
+  speaker identity, count, overlap, gains and WHAM SNR).
+- No mixture consistency projection (noise must not be forced back into
+  the speech estimates).
+- PIT loss on active sources + explicit inactive-output energy penalty.
+- Validation uses n_estimated_sources = max_num_sources for all cases;
+  the active speaker may appear in any output channel.
+
+@author Hamidreza (adapted from repo conventions)
 """
 
 import os
@@ -13,16 +23,13 @@ root_dir = os.path.abspath(os.path.join(current_dir, '../../../'))
 sys.path.append(root_dir)
 
 import torch
-from torch.nn import functional as F
 from tqdm import tqdm
 from pprint import pprint
-import sudo_rm_rf.dnn.experiments.utils.improved_cmd_args_parser_v2 as parser
-import sudo_rm_rf.dnn.experiments.utils.mixture_consistency \
-    as mixture_consistency
+import sudo_rm_rf.dnn.experiments.utils.improved_cmd_args_parser_v2 \
+    as parser
 import sudo_rm_rf.dnn.experiments.utils.dataset_setup as dataset_setup
 import sudo_rm_rf.dnn.losses.sisdr as sisdr_lib
-import sudo_rm_rf.dnn.losses.snr as snr_lib
-import sudo_rm_rf.dnn.losses.norm as norm_lib
+import sudo_rm_rf.dnn.losses.variable_speaker_snr as vsnr_lib
 import sudo_rm_rf.dnn.models.improved_sudormrf as improved_sudormrf
 import sudo_rm_rf.dnn.models.groupcomm_sudormrf_v2 as sudormrf_gc_v2
 import sudo_rm_rf.dnn.models.causal_improved_sudormrf_v3 as \
@@ -30,15 +37,12 @@ import sudo_rm_rf.dnn.models.causal_improved_sudormrf_v3 as \
 import sudo_rm_rf.dnn.models.sudormrf as initial_sudormrf
 import sudo_rm_rf.dnn.utils.cometml_loss_report as cometml_report
 import sudo_rm_rf.dnn.utils.cometml_log_audio as cometml_audio_logger
-import sudo_rm_rf.dnn.utils.log_audio as offline_audio_logger
 from sudo_rm_rf.dnn.utils.local_experiment import LocalExperiment
 
-# torch.backends.cudnn.enabled = False
 args = parser.get_args()
 hparams = vars(args)
-generators = dataset_setup.setup(hparams)
-# Hardcode n_sources for all the experiments with musdb
-assert hparams['n_channels'] == 1, 'Mono source separation is available for now'
+assert hparams['n_channels'] == 1, (
+    'Mono source separation is available for now')
 
 if hparams["checkpoints_path"] is not None:
     if hparams["save_checkpoint_every"] <= 0:
@@ -52,24 +56,35 @@ audio_loggers = dict(
       cometml_audio_logger.AudioLogger(fs=hparams["fs"],
                                        bs=1,
                                        n_sources=n_src))
-      for n_src in range(1, hparams['max_num_sources'] + 1)])
+     for n_src in range(1, hparams['max_num_sources'] + 1)])
 
-# offline_savedir = os.path.join('/home/thymios/offline_exps',
-#                                hparams["project_name"],
-#                                '_'.join(hparams['cometml_tags']))
-# if not os.path.exists(offline_savedir):
-#     os.makedirs(offline_savedir)
-# audio_logger = offline_audio_logger.AudioLogger(dirpath=offline_savedir,
-#     fs=hparams["fs"], bs=hparams["batch_size"], n_sources=4)
+generators = {}
 
-# Hardcode the test generator for each one of the number of sources
-for n_src in range(hparams['min_num_sources'], hparams['max_num_sources']+1):
+# Generate the training mixtures online (random speakers, placement,
+# gains, WHAM noise) from the FARSI_WHAM loader.
+train_loader = dataset_setup.create_loader_for_simple_dataset(
+    dataset_name='FARSI_WHAM',
+    separation_task='sep_noisy',
+    data_split='train', sample_rate=hparams['fs'],
+    n_channels=hparams['n_channels'], min_or_max='max',
+    zero_pad=hparams['zero_pad_audio'],
+    timelegth=hparams['audio_timelength'],
+    normalize_audio=hparams['normalize_audio'],
+    n_samples=hparams['n_train'],
+    min_num_sources=hparams['min_num_sources'],
+    max_num_sources=hparams['max_num_sources'])
+generators['train'] = train_loader.get_generator(
+    batch_size=hparams['batch_size'], num_workers=hparams['n_jobs'])
+
+# Hardcode separate val/test generators per one of the number of sources
+for n_src in range(hparams['min_num_sources'],
+                   hparams['max_num_sources'] + 1):
     for split_name in ['val', 'test']:
         loader = dataset_setup.create_loader_for_simple_dataset(
-            dataset_name='FUSS',
-            separation_task=hparams['separation_task'],
+            dataset_name='FARSI_WHAM',
+            separation_task='sep_noisy',
             data_split=split_name, sample_rate=hparams['fs'],
-            n_channels=hparams['n_channels'], min_or_max=hparams['min_or_max'],
+            n_channels=hparams['n_channels'], min_or_max='max',
             zero_pad=hparams['zero_pad_audio'],
             timelegth=hparams['audio_timelength'],
             normalize_audio=hparams['normalize_audio'],
@@ -96,46 +111,34 @@ else:
 os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(
     [cad for cad in hparams['cuda_available_devices']])
 
-back_loss_tr_loss_name, back_loss_tr_loss = (
-    'tr_back_loss_SNR',
-    # norm_lib.L1(return_individual_results=False)
-    # norm_lib.PermInvariantL1(n_sources=hparams["n_sources"],
-    #                          weighted_norm=True)
-    # 'tr_back_loss_SISDRi',
-    snr_lib.PermInvariantSNRwithZeroRefs(
-        n_sources=hparams["max_num_sources"],
-        zero_mean=False,
-        backward_loss=True,
-        inactivity_threshold=-40.)
-)
+# train loss: PIT-SNR on active sources + inactive outputs penalty
+back_loss_tr_loss_name = 'tr_back_loss_VAR_SPEAKER_SNR'
+back_loss_tr_loss = vsnr_lib.VariableSpeakerSNRwithZeroRefs(
+    n_sources=hparams["max_num_sources"],
+    zero_mean=False,
+    backward_loss=True,
+    inactive_threshold_dB=20.)
 
 val_losses = {}
 all_losses = []
-for val_set in [x for x in generators if not x == 'train']:
-    if generators[val_set] is None:
-        continue
-
+for val_set in generators:
     n_actual_sources = int(val_set.split('_')[1])
-    if n_actual_sources == 1:
-        single_source = False
-        improvement = False
-        metric_name = 'SISDR'
-        n_estimated_sources = 1
-    else:
-        single_source = False
-        improvement = True
-        n_estimated_sources = hparams['max_num_sources']
-        metric_name = 'SISDRi'
+    # The active speaker may appear in any of the output channels:
+    # always evaluate with the max number of estimated sources so that
+    # permutations of the estimated channels are considered.
+    n_estimated_sources = hparams['max_num_sources']
+    improvement = False
+    metric_name = 'SISDR'
     val_losses[val_set] = {}
     all_losses.append(val_set + '_{}'.format(metric_name))
     val_losses[val_set][val_set + '_{}'.format(metric_name)] = \
         sisdr_lib.StabilizedPermInvSISDRMetric(
             zero_mean=True,
-            single_source=single_source,
+            single_source=False,
             n_estimated_sources=n_estimated_sources,
             n_actual_sources=n_actual_sources,
             backward_loss=False,
-            improvement=improvement,
+            improvement=False,
             return_individual_results=True)
 all_losses.append(back_loss_tr_loss_name)
 
@@ -222,34 +225,12 @@ if hparams['resume_from_checkpoint'] is not None:
           'onwards.'.format(resume_path, start_epoch))
 
 
-def normalize_tensor_wav(wav_tensor, eps=1e-8, std=None):
-    mean = wav_tensor.mean(-1, keepdim=True)
+def scale_normalize(tensor_wav, eps=1e-8, std=None):
+    """Normalize by std only (optionally with an externally computed
+    std), preserving relative levels across channels."""
     if std is None:
-        std = wav_tensor.std(-1, keepdim=True)
-    return (wav_tensor - mean) / (std + eps)
-
-
-def online_augment(clean_sources):
-    # clean_sources: (batch, n_sources, time)
-    # Online mixing over samples of the batch. (This might cause to get
-    # mixtures from the same type of sound but it's highly improbable).
-    # Keep the exact same SNR distribution with the initial mixtures.
-    n_sources = clean_sources.shape[1]
-    batch_size = clean_sources.shape[0]
-
-    initial_biases = torch.mean(clean_sources, dim=-1, keepdim=True)
-    initial_energies = torch.std(clean_sources, dim=-1, keepdim=True)
-
-    augmented_wavs_l = []
-    for i in range(n_sources):
-        augmented_wavs_l.append(clean_sources[torch.randperm(batch_size), i])
-    augmented_wavs = torch.stack(augmented_wavs_l, 1)
-    # augmented_wavs = normalize_tensor_wav(augmented_wavs)
-    # augmented_wavs = (augmented_wavs * initial_energies) + initial_biases
-    augmented_wavs = augmented_wavs[:, torch.randperm(n_sources)]
-    augmented_wavs *= (torch.rand(batch_size, n_sources).unsqueeze(-1) + 0.5)
-
-    return augmented_wavs
+        std = tensor_wav.std(-1, keepdim=True)
+    return tensor_wav / (std + eps)
 
 
 if hparams['resume_from_checkpoint'] is None:
@@ -260,40 +241,36 @@ for i in range(start_epoch, hparams['n_epochs']):
     res_dic = {}
     for loss_name in all_losses:
         res_dic[loss_name] = {'mean': 0., 'std': 0., 'median': 0., 'acc': []}
-    print("FUSS Sudo-RM-RF: {} - {} || Epoch: {}/{}".format(
+    print("FARSI_WHAM SuDo-RM-RF: {} - {} || Epoch: {}/{}".format(
         experiment.get_key(), experiment.get_tags(), i+1, hparams['n_epochs']))
     model.train()
 
     sum_loss = 0.
     train_tqdm_gen = tqdm(generators['train'], desc='Training')
+    # Re-seed augmentation for each epoch
+    underlying_dataset = train_tqdm_gen.dataset
+    if hasattr(underlying_dataset, 'set_epoch'):
+        underlying_dataset.set_epoch(i)
     for cnt, data in enumerate(train_tqdm_gen):
         opt.zero_grad()
-        # data shape: (batch, n_sources, time_samples)
-        clean_wavs = online_augment(data)
-        clean_wavs = clean_wavs.cuda()
 
-        input_mixture = torch.sum(clean_wavs, -2, keepdim=True)
-        # input_mixture = normalize_tensor_wav(input_mixture)
+        input_mixture = data['mixture'].cuda()
+        clean_wavs = data['targets'].cuda()
+        n_speakers = data['n_speakers']
 
+        # joint normalization of input and references
         input_mix_std = input_mixture.std(-1, keepdim=True)
-        input_mix_mean = input_mixture.mean(-1, keepdim=True)
-        input_mixture = (input_mixture - input_mix_mean) / (
-                    input_mix_std + 1e-9)
-
-        # input_mix_std = input_mixture.std(-1, keepdim=True)
-        # input_mix_mean = input_mixture.mean(-1, keepdim=True)
-        # input_mixture = (input_mixture - input_mix_mean) / (input_mix_std + 1e-9)
-        # clean_wavs = normalize_tensor_wav(clean_wavs, std=input_mix_std)
+        input_mixture = scale_normalize(input_mixture, std=input_mix_std)
+        clean_wavs = scale_normalize(clean_wavs, std=input_mix_std)
 
         rec_sources_wavs = model(input_mixture)
-        # rec_sources_wavs = (rec_sources_wavs * input_mix_std) + input_mix_mean
-        rec_sources_wavs = mixture_consistency.apply(rec_sources_wavs,
-                                                     input_mixture)
 
-        # l = back_loss_tr_loss(normalize_tensor_wav(rec_sources_wavs),
-        #                       normalize_tensor_wav(clean_wavs))
+        # NO mixture consistency: the model is not supposed to
+        # reconstruct the WHAM noise.
+
         l = back_loss_tr_loss(rec_sources_wavs,
-                              clean_wavs)
+                              clean_wavs,
+                              input_mixture)
         l.backward()
 
         if hparams['clip_grad_norm'] > 0:
@@ -315,43 +292,34 @@ for i in range(start_epoch, hparams['n_epochs']):
     tr_step += 1
 
     for val_set in [x for x in generators if not x == 'train']:
-        if generators[val_set] is not None:
-            n_actual_sources = int(val_set.split('_')[1])
-            model.eval()
-            n_songs_written = 10
-            with torch.no_grad():
-                for data in tqdm(generators[val_set],
-                                 desc='Validation on {}'.format(val_set)):
-                    clean_wavs = data.cuda()
-                    input_mixture = torch.sum(clean_wavs, -2, keepdim=True)
-                    # input_mixture = normalize_tensor_wav(input_mixture)
-                    input_mix_std = input_mixture.std(-1, keepdim=True)
-                    input_mix_mean = input_mixture.mean(-1, keepdim=True)
-                    input_mixture = (input_mixture - input_mix_mean) / (
-                            input_mix_std + 1e-9)
+        n_actual_sources = int(val_set.split('_')[1])
+        model.eval()
+        with torch.no_grad():
+            for data in tqdm(generators[val_set],
+                             desc='Validation on {}'.format(val_set)):
+                input_mixture = data['mixture'].cuda()
+                # only the actually active targets should be evaluated
+                clean_wavs = data['targets'][:, :n_actual_sources].cuda()
+                # joint normalization of input and references
+                input_mix_std = input_mixture.std(-1, keepdim=True)
+                input_mixture = scale_normalize(input_mixture,
+                                                std=input_mix_std)
+                clean_wavs = scale_normalize(clean_wavs,
+                                             std=input_mix_std)
+                rec_sources_wavs = model(input_mixture)
 
-                    rec_sources_wavs = model(input_mixture)
-                    # rec_sources_wavs = (rec_sources_wavs * input_mix_std) + input_mix_mean
-                    rec_sources_wavs = mixture_consistency.apply(
+                for loss_name, loss_func in val_losses[val_set].items():
+                    l, best_perm = loss_func(
                         rec_sources_wavs,
-                        input_mixture)
+                        clean_wavs,
+                        return_best_permutation=True)
+                    res_dic[loss_name]['acc'] += l.tolist()
 
-                    for loss_name, loss_func in val_losses[val_set].items():
-                        # l, best_perm = loss_func(
-                        #     normalize_tensor_wav(rec_sources_wavs),
-                        #     normalize_tensor_wav(clean_wavs),
-                        #     return_best_permutation=True)
-                        l, best_perm = loss_func(
-                            rec_sources_wavs,
-                            clean_wavs,
-                            return_best_permutation=True)
-                        res_dic[loss_name]['acc'] += l.tolist()
-
-            audio_loggers[n_actual_sources].log_batch(
-                rec_sources_wavs[:, best_perm.long().cuda()][0, 0].unsqueeze(0),
-                clean_wavs[0].unsqueeze(0),
-                input_mixture[0].unsqueeze(0),
-                experiment, step=val_step, tag=val_set)
+        audio_loggers[n_actual_sources].log_batch(
+            rec_sources_wavs[:, best_perm.long().cuda()][0, 0].unsqueeze(0),
+            clean_wavs[0].unsqueeze(0),
+            input_mixture[0].unsqueeze(0),
+            experiment, step=val_step, tag=val_set)
 
     val_step += 1
 
@@ -384,7 +352,7 @@ for i in range(start_epoch, hparams['n_epochs']):
                 checkpoint,
                 os.path.join(
                     hparams["checkpoints_path"],
-                    "fuss_sudo_epoch_{}".format(tr_step)),
+                    "farsi_wham_sudo_epoch_{}".format(tr_step)),
             )
         print('Saved checkpoint at epoch: {} || tr_step: {}'.format(
             i, tr_step))

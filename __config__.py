@@ -9,5 +9,7 @@ MUSDB_ROOT_PATH = '/mnt/data/Music/MUSDB18'
 MUSDBWAV_ROOT_PATH = '/mnt/data/Music/MUSDB18wav'
 MUSDBWAV8K_ROOT_PATH = '/mnt/data/Music/MUSDB18wav8k'
 FUSS_ROOT_PATH = '/mnt/data/fuss_dataset/fuss_dev/ssdata'
+FARSI_WHAM_ROOT_PATH = '/data/farsi_wham'
+WHAM_NOISE_ROOT_PATH = '/data/wham_noise_16k'
 
 API_KEY = 'your_cometml_api_key'

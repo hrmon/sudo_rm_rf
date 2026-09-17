@@ -5,13 +5,15 @@
 """
 
 from __config__ import WHAM_ROOT_PATH, LIBRI2MIX_ROOT_PATH, \
-    MUSDBWAV8K_ROOT_PATH, MUSDBWAV_ROOT_PATH, FUSS_ROOT_PATH, WHAMR_ROOT_PATH
+    MUSDBWAV8K_ROOT_PATH, MUSDBWAV_ROOT_PATH, FUSS_ROOT_PATH, \
+    WHAMR_ROOT_PATH, FARSI_WHAM_ROOT_PATH, WHAM_NOISE_ROOT_PATH
 import sudo_rm_rf.dnn.dataset_loader.libri2mix as libri2mix
 import sudo_rm_rf.dnn.dataset_loader.wham as wham_loader
 import sudo_rm_rf.dnn.dataset_loader.whamr as whamr_loader
 import sudo_rm_rf.dnn.dataset_loader.fuss as fuss_loader
 import sudo_rm_rf.dnn.dataset_loader.musdb_dataset as \
     musdb_loader
+import sudo_rm_rf.dnn.dataset_loader.farsi_wham as farsi_wham_loader
 
 
 def create_loader_for_simple_dataset(dataset_name=None,
@@ -41,6 +43,21 @@ def create_loader_for_simple_dataset(dataset_name=None,
         root_path = FUSS_ROOT_PATH
         translator = {'train': 'train', 'test': 'eval', 'val': 'validation'}
         translated_split = translator[data_split]
+    elif dataset_name == 'FARSI_WHAM':
+        loader = farsi_wham_loader
+        root_path = FARSI_WHAM_ROOT_PATH
+        translator = {'train': 'train', 'test': 'eval',
+                      'val': 'validation'}
+        translated_split = translator[data_split]
+        data_loader = loader.Dataset(
+            root_dirpath=root_path, noise_dirpath=WHAM_NOISE_ROOT_PATH,
+            task=separation_task, split=translated_split,
+            sample_rate=sample_rate, timelength=timelegth,
+            zero_pad=zero_pad,
+            augment=data_split.split('_')[0] == 'train',
+            normalize_audio=normalize_audio, n_samples=n_samples,
+            min_num_sources=min_num_sources, max_num_sources=max_num_sources)
+        return data_loader
     elif dataset_name == 'LIBRI2MIX':
         loader = libri2mix
         root_path = LIBRI2MIX_ROOT_PATH
