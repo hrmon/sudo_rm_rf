@@ -1,0 +1,26 @@
+# Requirements for the FARSI_WHAM variable-speaker separation training
+# (sudo_rm_rf/dnn/experiments/run_farsi_wham_separation.py) on a single
+# NVIDIA RTX 3080 Ti (SM 8.6, 12 GB), CUDA-capable driver 13.0.
+#
+# Target platform: python 3.12
+#
+# Install:
+#   pip install -r requirements_gpu_training.txt
+# NOTE: the --extra-index-url below selects the CUDA 12.6 build of torch;
+# a CUDA 13.0 driver is backwards compatible with every CUDA-runtime
+# wheel (cu118/cu126/cu128), so this installs fine on a 13.0 driver box
+# without any locally installed CUDA toolkit.
+
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch>=2.6,<3.0
+numpy==1.26.4
+scipy==1.15.3
+soundfile==0.14.0
+tqdm==4.70.1
+glob2==0.7
+# datasets_setup.py imports musdb_dataset unconditionally, so the
+# musdb package is needed even for the FARSI_WHAM path
+musdb==0.4.3
+# only needed for the one-time offline cache build
+# (sudo_rm_rf/utils/prepare_farsi_wham_cache.py)
+datasets>=3.0,<4.0
