@@ -86,12 +86,75 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
     exit 1
 fi
 
+# ---- pre-flight checks (fail fast before the tmux pane dies silently) ----
+MISSING=()
+for f in "$REPO_ROOT/__config__.py" "$EXPERIMENTS_ROOT/run_farsi_wham_separation.py"; do
+    [[ -f "$f" ]] || MISSING+=("$f")
+done
+if [[ ${#MISSING[@]} -gt 0 ]]; then
+    echo "ERROR: missing runner files: ${MISSING[*]} (repo layout unexpected?)"
+    exit 1
+fi
+
+"$PYTHON_BIN" - <<'PYEOF'
+import importlib, sys
+missing = []
+for mod in ('torch', 'scipy', 'soundfile', 'glob2', 'musdb'):
+    try:
+        mod = __import__(mod)
+    except ImportError:
+        missing.append(mod)
+if missing:
+    print('PYTHON ENV ERROR: missing modules: {}.'.format(
+        ' '.join(missing)))
+    print('-> Activate the training venv (or set PYTHON_BIN), and install '
+          'requirements: pip install -r requirements_gpu_training.txt')
+    sys.exit(1)
+PYEOF
+if [[ $? -ne 0 ]]; then
+    exit 1
+fi
+
+# the FARSI_WHAM loader requires the index jsons built by
+# prepare_farsi_wham_cache: check the paths from __config__
+if ! "$PYTHON_BIN" - <<PYEOF
+import os, sys
+sys.path.insert(0, '${REPO_ROOT}')
+from __config__ import FARSI_WHAM_ROOT_PATH, WHAM_NOISE_ROOT_PATH
+ok = True
+for p in (os.path.join(FARSI_WHAM_ROOT_PATH, 'speech_index.json'),
+          os.path.join(WHAM_NOISE_ROOT_PATH, 'noise_index.json')):
+    if not os.path.lexists(p):
+        print('CACHE MISSING: {} does not exist.'.format(p))
+        ok = False
+if not ok:
+    print('-> Build the caches first with:')
+    print('   python -m sudo_rm_rf.utils.prepare_farsi_wham_cache '
+          '--speech_out {} --noise_out {}'.format(
+              FARSI_WHAM_ROOT_PATH, WHAM_NOISE_ROOT_PATH))
+    sys.exit(1)
+PYEOF
+then
+    echo "ERROR: training data caches are missing (or __config__ failed to import); see the message above."
+    exit 1
+fi
+
+# everything that tmux will print is also persisted here, so that
+# instant-crashing panes leave a readable error behind
 cd "$EXPERIMENTS_ROOT"
 tmux new-session -d -s "$SESSION" \
-    "bash \"${CHECKPOINTS}/train_cmd.sh\" 2>&1" \
+    "bash \"${CHECKPOINTS}/train_cmd.sh\" 2>&1 | tee ${CHECKPOINTS}/train_out.log" \
     || { echo "tmux launch failed."; exit 1; }
 
 sleep 2
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "ERROR: tmux session died within 2s of launch. Last output lines:"
+    tail -n 15 "${CHECKPOINTS}/train_out.log" 2>/dev/null || \
+        echo "(no output captured)"
+    echo "Full output: ${CHECKPOINTS}/train_out.log"
+    exit 1
+fi
+
 PID=$(pgrep -fo run_farsi_wham_separation.py || true)
 cat > "${CHECKPOINTS}/run_info.json" <<EOF
 {"started": "$(date '+%Y-%m-%dT%H:%M:%S%z')", "tmux_session": "$SESSION",
