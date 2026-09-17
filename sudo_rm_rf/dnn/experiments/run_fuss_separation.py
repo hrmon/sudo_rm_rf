@@ -42,6 +42,13 @@ generators = dataset_setup.setup(hparams)
 # Hardcode n_sources for all the experiments with musdb
 assert hparams['n_channels'] == 1, 'Mono source separation is available for now'
 
+if hparams["checkpoints_path"] is not None:
+    if hparams["save_checkpoint_every"] <= 0:
+        raise ValueError("Expected a value greater than 0 for checkpoint "
+                         "storing.")
+    if not os.path.exists(hparams["checkpoints_path"]):
+        os.makedirs(hparams["checkpoints_path"])
+
 audio_loggers = dict(
     [(n_src,
       cometml_audio_logger.AudioLogger(fs=hparams["fs"],
@@ -180,9 +187,38 @@ print('Trainable Parameters: {}'.format(numparams))
 
 model = torch.nn.DataParallel(model).cuda()
 opt = torch.optim.Adam(model.parameters(), lr=hparams['learning_rate'])
-# lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-#     optimizer=opt, mode='max', factor=1. / hparams['divide_lr_by'],
-#     patience=hparams['patience'], verbose=True)
+
+model_shaping_hparams = ['model_type', 'out_channels', 'in_channels',
+                         'num_blocks', 'upsampling_depth', 'enc_kernel_size',
+                         'enc_num_basis', 'max_num_sources']
+
+start_epoch = 0
+if hparams['resume_from_checkpoint'] is not None:
+    resume_path = hparams['resume_from_checkpoint']
+    if resume_path == 'latest':
+        if hparams['checkpoints_path'] is None:
+            raise ValueError("'latest' resume requires --checkpoints_path "
+                             "to be set.")
+        resume_path = os.path.join(hparams['checkpoints_path'],
+                                   'latest_checkpoint.pt')
+    if not os.path.lexists(resume_path):
+        raise ValueError('Requested resume checkpoint: {} but it was '
+                         'not found.'.format(resume_path))
+    checkpoint = torch.load(resume_path, map_location='cuda')
+    for hp_name in model_shaping_hparams:
+        if hparams[hp_name] != checkpoint['hparams'][hp_name]:
+            raise ValueError('Resumed checkpoint was created with different '
+                             'hparams. For {} the requested value was {} '
+                             'while the stored one was {}.'.format(
+                                 hp_name, hparams[hp_name],
+                                 checkpoint['hparams'][hp_name]))
+    model.load_state_dict(checkpoint['model_state_dict'])
+    opt.load_state_dict(checkpoint['optimizer_state_dict'])
+    tr_step = checkpoint['tr_step']
+    val_step = checkpoint['val_step']
+    start_epoch = checkpoint['epoch'] + 1
+    print('Resumed training from checkpoint: {} for epoch {} '
+          'onwards.'.format(resume_path, start_epoch))
 
 
 def normalize_tensor_wav(wav_tensor, eps=1e-8, std=None):
@@ -215,10 +251,11 @@ def online_augment(clean_sources):
     return augmented_wavs
 
 
-tr_step = 0
-val_step = 0
+if hparams['resume_from_checkpoint'] is None:
+    tr_step = 0
+    val_step = 0
 prev_epoch_val_loss = 0.
-for i in range(hparams['n_epochs']):
+for i in range(start_epoch, hparams['n_epochs']):
     res_dic = {}
     for loss_name in all_losses:
         res_dic[loss_name] = {'mean': 0., 'std': 0., 'median': 0., 'acc': []}
@@ -325,3 +362,28 @@ for i in range(hparams['n_epochs']):
     for loss_name in res_dic:
         res_dic[loss_name]['acc'] = []
     pprint(res_dic)
+
+    if hparams["checkpoints_path"] is not None:
+        checkpoint = {
+            'epoch': i,
+            'tr_step': tr_step,
+            'val_step': val_step,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': opt.state_dict(),
+            'hparams': {name: hparams[name]
+                        for name in model_shaping_hparams},
+        }
+        latest_path = os.path.join(hparams['checkpoints_path'],
+                                   'latest_checkpoint.pt')
+        tmp_path = latest_path + '.tmp'
+        torch.save(checkpoint, tmp_path)
+        os.replace(tmp_path, latest_path)
+        if tr_step % hparams["save_checkpoint_every"] == 0:
+            torch.save(
+                checkpoint,
+                os.path.join(
+                    hparams["checkpoints_path"],
+                    "fuss_sudo_epoch_{}".format(tr_step)),
+            )
+        print('Saved checkpoint at epoch: {} || tr_step: {}'.format(
+            i, tr_step))

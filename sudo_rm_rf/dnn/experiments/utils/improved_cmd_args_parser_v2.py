@@ -149,6 +149,12 @@ def get_args():
     parser.add_argument("--save_checkpoint_every", type=int,
                         help="""Number of epochs between each model save.""",
                         default=0)
+    parser.add_argument("-rfc", "--resume_from_checkpoint", type=str,
+                        help="""Path to a .pt checkpoint file for resuming
+                            training. If 'latest' is passed then the latest
+                            checkpoint stored inside checkpoints_path is
+                            going to be used instead.""",
+                        default=None)
     # ===============================================
     # Separation model (SuDO-RM-RF) params
     parser.add_argument("--out_channels", type=int,
