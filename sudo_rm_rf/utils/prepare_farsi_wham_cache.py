@@ -30,6 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from scipy.signal import resample_poly
 import soundfile as sf
+from tqdm import tqdm
 
 
 def build_arg_parser():
@@ -81,9 +82,12 @@ def prepare_speech(cache_root, fs, min_speech_sec, n_jobs, cache_dir=None):
 
     os.makedirs(speech_dir, exist_ok=True)
     index = {}
-    futures = []
-    from concurrent.futures import ThreadPoolExecutor
+    n_total = len(ds)
+    discarded = 0
+    # speech cache: decode in one pool, write in another, filenames are
+    # assigned in the main thread so that ids cannot collide
     pool_w = ThreadPoolExecutor(max_workers=n_jobs)
+    pool_w.__enter__()
     with ThreadPoolExecutor(max_workers=n_jobs) as pool_d:
         def decode(example):
             audio = example['mp3']
@@ -93,19 +97,24 @@ def prepare_speech(cache_root, fs, min_speech_sec, n_jobs, cache_dir=None):
             wav = resample_to(wav.astype(np.float32), fs_orig, fs)
             return example['speaker_id'], wav
 
-        for speaker_id, wav in pool_d.map(decode, ds):
+        pbar = tqdm(pool_d.map(decode, ds), total=n_total, unit='clip',
+                    desc='Caching speech (resampling to {}Hz)'.format(fs))
+        for speaker_id, wav in pbar:
             dur = len(wav) / float(fs)
             if dur < min_speech_sec:
+                discarded += 1
                 continue
             speaker_dir = os.path.join(speech_dir, speaker_id)
             os.makedirs(speaker_dir, exist_ok=True)
             idx = len(index.get(speaker_id, []))
             out_path = os.path.join(speaker_dir, '{}.wav'.format(
                 str(idx).zfill(6)))
-            futures.append(pool_w.submit(write_wav_pair, (out_path, wav, fs)))
+            pool_w.submit(write_wav_pair, (out_path, wav, fs))
             paths = index.setdefault(speaker_id, [])
             paths.append(os.path.abspath(out_path))
-    pool_w.shutdown()
+            pbar.set_postfix(speakers=len(index),
+                             discarded=discarded)
+    pool_w.__exit__(None, None, None)
 
     for speaker_id in index:
         index[speaker_id].sort()
@@ -131,7 +140,8 @@ def prepare_noise(cache_root, fs, n_jobs, cache_dir=None):
     label_map = {0: 'cv', 1: 'tr', 2: 'tt'}
 
     index = {k: [] for k in label_map.values()}
-    from concurrent.futures import ThreadPoolExecutor
+    # filenames are assigned in the main thread (decode runs on workers,
+    # so counting inside decode could collide on the same idx filename)
     with ThreadPoolExecutor(max_workers=n_jobs) as pool_w:
         def decode(example):
             audio = example['audio']
@@ -140,16 +150,24 @@ def prepare_noise(cache_root, fs, n_jobs, cache_dir=None):
                 wav = wav.mean(-1)
             wav = resample_to(wav.astype(np.float32), fs_orig, fs)
             split = label_map[int(example['label'])]
+            if np.mean(wav ** 2) < 1e-10:
+                return None
+            return split, wav
+
+        results = (r for r in pool_w.map(decode, ds)
+                   if r is not None)
+        pbar = tqdm(results, total=len(ds), unit='clip',
+                    desc='Caching noise (resampling to {}Hz)'.format(fs))
+        for split, wav in pbar:
             split_dir = os.path.join(cache_root, split)
             os.makedirs(split_dir, exist_ok=True)
+            idx = len(index[split])
             out_path = os.path.join(split_dir, '{}.wav'.format(
-                str(len(index[split])).zfill(6)))
-            write_wav_pair((out_path, wav, fs))
-            index[split].append(out_path)
-            return example['label']
-
-        for _ in pool_w.map(decode, ds):
-            pass
+                str(idx).zfill(6)))
+            pool_w.submit(write_wav_pair, (out_path, wav, fs))
+            index[split].append(os.path.abspath(out_path))
+            pbar.set_postfix(tr=len(index['tr']), cv=len(index['cv']),
+                             tt=len(index['tt']))
 
     with open(os.path.join(cache_root, 'noise_index.json'), 'w') as f:
         json.dump({'fs': fs, 'splits': index}, f)
