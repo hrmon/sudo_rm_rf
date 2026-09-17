@@ -122,6 +122,8 @@ back_loss_tr_loss = vsnr_lib.VariableSpeakerSNRwithZeroRefs(
 val_losses = {}
 all_losses = []
 for val_set in generators:
+    if val_set == 'train':
+        continue
     n_actual_sources = int(val_set.split('_')[1])
     # The active speaker may appear in any of the output channels:
     # always evaluate with the max number of estimated sources so that
