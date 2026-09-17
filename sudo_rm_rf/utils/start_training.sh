@@ -25,6 +25,19 @@ NVAL=${NVAL:-1000}
 NTEST=${NTEST:-1000}
 PYTHON_BIN=${PYTHON_BIN:-python}
 
+# resolve the three output dirs to absolute paths before any other
+# cwd-changing step: the script later cd's into the experiments dir to
+# launch tmux, and relative paths here would then resolve from there
+abspath() {
+    case "$1" in
+    /*) printf '%s\n' "$1";;
+    *) printf '%s\n' "$(pwd)/$1";;
+    esac
+}
+CHECKPOINTS="$(abspath "$CHECKPOINTS")"
+METRICS="$(abspath "$METRICS")"
+LOGS="$(abspath "$LOGS")"
+
 extra_args=()
 if [[ $# -gt 0 ]]; then
     if [[ "$1" != "--" ]]; then
@@ -74,17 +87,19 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
 fi
 
 cd "$EXPERIMENTS_ROOT"
-tmux new-session -d -s "$SESSION" "bash ${CHECKPOINTS}/train_cmd.sh 2>&1" \
+tmux new-session -d -s "$SESSION" \
+    "bash \"${CHECKPOINTS}/train_cmd.sh\" 2>&1" \
     || { echo "tmux launch failed."; exit 1; }
 
 sleep 2
 PID=$(pgrep -fo run_farsi_wham_separation.py || true)
 cat > "${CHECKPOINTS}/run_info.json" <<EOF
-{"started": "$(date -Is)", "tmux_session": "$SESSION",
+{"started": "$(date '+%Y-%m-%dT%H:%M:%S%z')", "tmux_session": "$SESSION",
  "runner_pid": "${PID:-unknown}", "checkpoints": "${CHECKPOINTS}",
  "metrics": "${METRICS}", "logs": "${LOGS}", "resumed": "$RESUME"}
 EOF
 
 echo "Training launched in tmux session: $SESSION"
 echo "  attach live output:  tmux attach -t $SESSION"
-echo "  status check:        python utils/monitor_training.py --checkpoints_path $CHECKPOINTS --metrics_path $METRICS"
+echo "  status check:        python ${REPO_ROOT}/sudo_rm_rf/utils/monitor_training.py \\
+    --checkpoints_path $CHECKPOINTS --metrics_path $METRICS"
