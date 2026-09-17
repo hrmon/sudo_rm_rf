@@ -12,9 +12,6 @@ current_dir = os.path.dirname(os.path.abspath('__file__'))
 root_dir = os.path.abspath(os.path.join(current_dir, '../../../'))
 sys.path.append(root_dir)
 
-from __config__ import API_KEY
-from comet_ml import Experiment, OfflineExperiment
-
 import torch
 from torch.nn import functional as F
 from tqdm import tqdm
@@ -34,6 +31,7 @@ import sudo_rm_rf.dnn.models.sudormrf as initial_sudormrf
 import sudo_rm_rf.dnn.utils.cometml_loss_report as cometml_report
 import sudo_rm_rf.dnn.utils.cometml_log_audio as cometml_audio_logger
 import sudo_rm_rf.dnn.utils.log_audio as offline_audio_logger
+from sudo_rm_rf.dnn.utils.local_experiment import LocalExperiment
 
 # torch.backends.cudnn.enabled = False
 args = parser.get_args()
@@ -81,8 +79,11 @@ for n_src in range(hparams['min_num_sources'], hparams['max_num_sources']+1):
         generators[gen_name] = loader.get_generator(
             batch_size=hparams['batch_size'], num_workers=hparams['n_jobs'])
 
-# experiment = OfflineExperiment(API_KEY, offline_directory=offline_savedir)
-experiment = Experiment(API_KEY, project_name=hparams['project_name'])
+experiment = LocalExperiment(
+    logs_path=(hparams['experiment_logs_path']
+               if hparams['experiment_logs_path'] is not None
+               else 'offline_exps'),
+    project_name=hparams['project_name'])
 experiment.log_parameters(hparams)
 experiment_name = '_'.join(hparams['cometml_tags'])
 for tag in hparams['cometml_tags']:
