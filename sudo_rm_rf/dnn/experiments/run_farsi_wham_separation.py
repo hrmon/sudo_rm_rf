@@ -250,7 +250,7 @@ for i in range(start_epoch, hparams['n_epochs']):
     sum_loss = 0.
     train_tqdm_gen = tqdm(generators['train'], desc='Training')
     # Re-seed augmentation for each epoch
-    underlying_dataset = train_tqdm_gen.dataset
+    underlying_dataset = generators['train'].dataset
     if hasattr(underlying_dataset, 'set_epoch'):
         underlying_dataset.set_epoch(i)
     for cnt, data in enumerate(train_tqdm_gen):
