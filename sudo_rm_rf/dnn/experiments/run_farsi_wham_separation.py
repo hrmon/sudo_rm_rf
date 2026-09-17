@@ -330,6 +330,19 @@ for i in range(start_epoch, hparams['n_epochs']):
                                                         tr_step,
                                                         val_step)
 
+    # optional local metrics persistence (e.g. on gdrive)
+    if hparams['metrics_logs_path'] is not None:
+        import json as json_lib
+        if not os.path.lexists(hparams['metrics_logs_path']):
+            os.makedirs(hparams['metrics_logs_path'])
+        metrics_path = os.path.join(
+            hparams['metrics_logs_path'], 'metrics.jsonl')
+        new_lr_num = opt.param_groups[0]['lr']
+        with open(metrics_path, 'a') as metrics_file:
+            metrics_file.write(json_lib.dumps(
+                {'epoch': i, 'tr_step': tr_step, 'val_step': val_step,
+                 'lr': new_lr_num, 'losses': res_dic}) + '\n')
+
     for loss_name in res_dic:
         res_dic[loss_name]['acc'] = []
     pprint(res_dic)
