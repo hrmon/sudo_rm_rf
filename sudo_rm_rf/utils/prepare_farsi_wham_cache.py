@@ -51,6 +51,11 @@ def build_arg_parser():
     parser.add_argument('--min_speech_sec', type=float, default=2.0,
                         help='Discard speech clips shorter than this.')
     parser.add_argument('--n_jobs', type=int, default=4)
+    parser.add_argument('--chunk_size', type=int, default=128,
+                        help='Number of clips decoded in flight at any '
+                             'time; bounds the decode pipeline RAM usage '
+                             '(the wav decoder pool holds one chunk of '
+                             'result wavs max).')
     parser.add_argument('--speech_only', action='store_true')
     parser.add_argument('--noise_only', action='store_true')
     return parser
@@ -70,7 +75,24 @@ def write_wav_pair(task):
     return out_path
 
 
-def prepare_speech(cache_root, fs, min_speech_sec, n_jobs, cache_dir=None):
+def iter_chunks(iterable, chunk_size):
+    """Yield lists of at most chunk_size items from a (lazy) iterable."""
+    iterator = iter(iterable)
+    while True:
+        chunk = []
+        try:
+            for _ in range(chunk_size):
+                chunk.append(next(iterator))
+        except StopIteration:
+            pass
+        if chunk:
+            yield chunk
+        if len(chunk) < chunk_size:
+            break
+
+
+def prepare_speech(cache_root, fs, min_speech_sec, n_jobs, chunk_size=128,
+                   cache_dir=None):
     import datasets
     speech_dir = os.path.join(cache_root, 'speech')
     if os.path.exists(os.path.join(cache_root, 'speech_index.json')):
@@ -88,10 +110,11 @@ def prepare_speech(cache_root, fs, min_speech_sec, n_jobs, cache_dir=None):
     index = {}
     n_total = len(ds)
     discarded = 0
-    # speech cache: decode in one pool, write in another, filenames are
-    # assigned in the main thread so that ids cannot collide
-    pool_w = ThreadPoolExecutor(max_workers=n_jobs)
-    pool_w.__enter__()
+    # speech cache: filenames are assigned in the main thread so that
+    # idx ids cannot collide. The dataset is processed in bounded chunks;
+    # a plain unbounded executor.map submits all 23k examples at once
+    # and keeps every decoded waveform alive until the iterator gets to
+    # it, OOM-ing machines with little RAM.
     with ThreadPoolExecutor(max_workers=n_jobs) as pool_d:
         def decode(example):
             audio = example['mp3']
@@ -101,24 +124,27 @@ def prepare_speech(cache_root, fs, min_speech_sec, n_jobs, cache_dir=None):
             wav = resample_to(wav.astype(np.float32), fs_orig, fs)
             return example['speaker_id'], wav
 
-        pbar = tqdm(pool_d.map(decode, ds), total=n_total, unit='clip',
+        pbar = tqdm(total=n_total, unit='clip',
                     desc='Caching speech (resampling to {}Hz)'.format(fs))
-        for speaker_id, wav in pbar:
-            dur = len(wav) / float(fs)
-            if dur < min_speech_sec:
-                discarded += 1
-                continue
-            speaker_dir = os.path.join(speech_dir, speaker_id)
-            os.makedirs(speaker_dir, exist_ok=True)
-            idx = len(index.get(speaker_id, []))
-            out_path = os.path.join(speaker_dir, '{}.wav'.format(
-                str(idx).zfill(6)))
-            pool_w.submit(write_wav_pair, (out_path, wav, fs))
-            paths = index.setdefault(speaker_id, [])
-            paths.append(os.path.abspath(out_path))
-            pbar.set_postfix(speakers=len(index),
-                             discarded=discarded)
-    pool_w.__exit__(None, None, None)
+        for chunk in iter_chunks(ds, chunk_size):
+            for speaker_id, wav in pool_d.map(decode, chunk):
+                dur = len(wav) / float(fs)
+                if dur < min_speech_sec:
+                    discarded += 1
+                    pbar.update(1)
+                    continue
+                speaker_dir = os.path.join(speech_dir, speaker_id)
+                os.makedirs(speaker_dir, exist_ok=True)
+                idx = len(index.get(speaker_id, []))
+                out_path = os.path.join(speaker_dir, '{}.wav'.format(
+                    str(idx).zfill(6)))
+                write_wav_pair((out_path, wav, fs))
+                paths = index.setdefault(speaker_id, [])
+                paths.append(os.path.abspath(out_path))
+                pbar.update(1)
+                pbar.set_postfix(speakers=len(index),
+                                 discarded=discarded)
+        pbar.close()
 
     for speaker_id in index:
         index[speaker_id].sort()
@@ -129,7 +155,7 @@ def prepare_speech(cache_root, fs, min_speech_sec, n_jobs, cache_dir=None):
         len(index), sum(len(v) for v in index.values())))
 
 
-def prepare_noise(cache_root, fs, n_jobs, cache_dir=None):
+def prepare_noise(cache_root, fs, n_jobs, chunk_size=128, cache_dir=None):
     import datasets
     if os.path.exists(os.path.join(cache_root, 'noise_index.json')):
         print('noise_index.json already exists, skipping noise cache.')
@@ -138,23 +164,24 @@ def prepare_noise(cache_root, fs, n_jobs, cache_dir=None):
     index = {k: [] for k in ('tr', 'cv', 'tt')}
     # Filenames are assigned in the main thread (decode runs on workers,
     # so counting/starting inside decode could collide on the same idx
-    # filename).
-    with ThreadPoolExecutor(max_workers=n_jobs) as pool_w:
-        for hf_split in ('train', 'eval', 'test'):
-            ds_kwargs = dict()
-            if cache_dir is not None:
-                ds_kwargs['cache_dir'] = cache_dir
-            # Keep original WHAM splits: the per-row `label` column
-            # (0=cv, 1=tr, 2=tt) exists in eval \& test but is null in
-            # the HF `train` split (which is all original WHAM `tr`
-            # noise anyway). Fall back to the HF split name when label
-            # is missing. HF split -> WHAM split:
-            #   train -> tr, eval -> cv, test -> tt
-            ds = datasets.load_dataset(
-                'montaseri/wham-noise-subset-sharded',
-                split=hf_split, **ds_kwargs)
-            label_map = {0: 'cv', 1: 'tr', 2: 'tt'}
+    # filename). Chunked processing bounds the amount of decoded
+    # waveforms alive in RAM (see prepare_speech comment).
+    for hf_split in ('train', 'eval', 'test'):
+        ds_kwargs = dict()
+        if cache_dir is not None:
+            ds_kwargs['cache_dir'] = cache_dir
+        # Keep original WHAM splits: the per-row `label` column
+        # (0=cv, 1=tr, 2=tt) exists in eval \& test but is null in
+        # the HF `train` split (which is all original WHAM `tr`
+        # noise anyway). Fall back to the HF split name when label
+        # is missing. HF split -> WHAM split:
+        #   train -> tr, eval -> cv, test -> tt
+        ds = datasets.load_dataset(
+            'montaseri/wham-noise-subset-sharded',
+            split=hf_split, **ds_kwargs)
+        label_map = {0: 'cv', 1: 'tr', 2: 'tt'}
 
+        with ThreadPoolExecutor(max_workers=n_jobs) as pool_d:
             def decode(example, hf_split=hf_split):
                 audio = example['audio']
                 wav, fs_orig = audio['array'], audio['sampling_rate']
@@ -171,26 +198,27 @@ def prepare_noise(cache_root, fs, n_jobs, cache_dir=None):
                              'test': 'tt'}[hf_split]
                 return split, wav
 
-            results = (r for r in pool_w.map(decode, ds)
-                       if r is not None)
-            pbar = tqdm(results, total=len(ds), unit='clip',
+            pbar = tqdm(total=len(ds), unit='clip',
                         desc='Caching noise [{}] (resampling to {}Hz)'
                              ''.format(hf_split, fs))
-            for split, wav in pbar:
-                split_dir = os.path.join(cache_root, split)
-                os.makedirs(split_dir, exist_ok=True)
-                idx = len(index[split])
-                out_path = os.path.join(split_dir, '{}.wav'.format(
-                    str(idx).zfill(6)))
-                pool_w.submit(write_wav_pair, (out_path, wav, fs))
-                index[split].append(os.path.abspath(out_path))
-                pbar.set_postfix(tr=len(index['tr']), cv=len(index['cv']),
-                                 tt=len(index['tt']))
-
-    with open(os.path.join(cache_root, 'noise_index.json'), 'w') as f:
-        json.dump({'fs': fs, 'splits': index}, f)
-    print('Noise cache done: ' + ', '.join(
-        '{}: {}'.format(k, len(v)) for k, v in index.items()))
+            for chunk in iter_chunks(ds, chunk_size):
+                for result in pool_d.map(decode, chunk):
+                    if result is None:
+                        pbar.update(1)
+                        continue
+                    split, wav = result
+                    split_dir = os.path.join(cache_root, split)
+                    os.makedirs(split_dir, exist_ok=True)
+                    idx = len(index[split])
+                    out_path = os.path.join(split_dir, '{}.wav'.format(
+                        str(idx).zfill(6)))
+                    write_wav_pair((out_path, wav, fs))
+                    index[split].append(os.path.abspath(out_path))
+                    pbar.update(1)
+                    pbar.set_postfix(tr=len(index['tr']),
+                                     cv=len(index['cv']),
+                                     tt=len(index['tt']))
+            pbar.close()
 
     with open(os.path.join(cache_root, 'noise_index.json'), 'w') as f:
         json.dump({'fs': fs, 'splits': index}, f)
@@ -202,6 +230,7 @@ if __name__ == '__main__':
     args = build_arg_parser().parse_args()
     if not args.noise_only:
         prepare_speech(args.speech_out, args.fs, args.min_speech_sec,
-                       args.n_jobs)
+                       args.n_jobs, chunk_size=args.chunk_size)
     if not args.speech_only:
-        prepare_noise(args.noise_out, args.fs, args.n_jobs)
+        prepare_noise(args.noise_out, args.fs, args.n_jobs,
+                      chunk_size=args.chunk_size)
