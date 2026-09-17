@@ -76,10 +76,13 @@ train_loader = dataset_setup.create_loader_for_simple_dataset(
 generators['train'] = train_loader.get_generator(
     batch_size=hparams['batch_size'], num_workers=hparams['n_jobs'])
 
-# Hardcode separate val/test generators per one of the number of sources
+# Hardcode separate val/test generators per one of the number of sources.
+# n_samples: --n_val/--n_test cap how many examples are evaluated; 0
+# falls back to the loader default (10000).
 for n_src in range(hparams['min_num_sources'],
                    hparams['max_num_sources'] + 1):
     for split_name in ['val', 'test']:
+        n_samples_key = 'n_val' if split_name == 'val' else 'n_test'
         loader = dataset_setup.create_loader_for_simple_dataset(
             dataset_name='FARSI_WHAM',
             separation_task='sep_noisy',
@@ -88,7 +91,8 @@ for n_src in range(hparams['min_num_sources'],
             zero_pad=hparams['zero_pad_audio'],
             timelegth=hparams['audio_timelength'],
             normalize_audio=hparams['normalize_audio'],
-            n_samples=0, min_num_sources=n_src, max_num_sources=n_src)
+            n_samples=hparams[n_samples_key],
+            min_num_sources=n_src, max_num_sources=n_src)
 
         gen_name = '{}_{}_srcs'.format(split_name, n_src)
         generators[gen_name] = loader.get_generator(
@@ -293,12 +297,24 @@ for i in range(start_epoch, hparams['n_epochs']):
                 param_group['lr'] = new_lr
     tr_step += 1
 
-    for val_set in [x for x in generators if not x == 'train']:
+    # Test evaluation happens only once, after the final epoch: the test
+    # split exists for an unbiased final report, not to monitor training.
+    final_epoch = (i == hparams['n_epochs'] - 1)
+    validation_sets = [x for x in generators
+                       if not x == 'train']
+    if not final_epoch:
+        validation_sets = [
+            val_set for val_set in validation_sets
+            if val_set.startswith('val_')]
+    for val_set in validation_sets:
+        evaluation_split_name = 'Testing' if val_set.startswith(
+            'test_') and final_epoch else 'Validation'
         n_actual_sources = int(val_set.split('_')[1])
         model.eval()
         with torch.no_grad():
             for data in tqdm(generators[val_set],
-                             desc='Validation on {}'.format(val_set)):
+                             desc='{} on {}'.format(
+                                 evaluation_split_name, val_set)):
                 input_mixture = data['mixture'].cuda()
                 # only the actually active targets should be evaluated
                 clean_wavs = data['targets'][:, :n_actual_sources].cuda()
@@ -338,10 +354,16 @@ for i in range(start_epoch, hparams['n_epochs']):
         metrics_path = os.path.join(
             hparams['metrics_logs_path'], 'metrics.jsonl')
         new_lr_num = opt.param_groups[0]['lr']
+        # only dump buckets that actually ran this epoch (test buckets
+        # are empty on non-final epochs)
+        losses_out = {name: {'mean': value['mean'], 'std': value['std']}
+                      for name, value in res_dic.items()
+                      if len(value['acc']) > 0}
         with open(metrics_path, 'a') as metrics_file:
             metrics_file.write(json_lib.dumps(
                 {'epoch': i, 'tr_step': tr_step, 'val_step': val_step,
-                 'lr': new_lr_num, 'losses': res_dic}) + '\n')
+                 'lr': new_lr_num,
+                 'losses': losses_out}) + '\n')
 
     for loss_name in res_dic:
         res_dic[loss_name]['acc'] = []
