@@ -290,13 +290,19 @@ for i in range(start_epoch, hparams['n_epochs']):
         train_tqdm_gen.set_description(
             "Training, Running Avg Loss: {}".format(sum_loss / (cnt + 1)))
 
+    # Recompute lr from the schedule EVERY epoch, not only at milestone
+    # steps (tr_step % patience == 0): this makes the schedule a pure
+    # function of tr_step and patience, so resuming with a different
+    # --patience takes effect immediately instead of waiting for the
+    # next milestone boundary (on resume, the optimizer restores the
+    # stale lr otherwise, strangling training at the old lr).
     if hparams['patience'] > 0:
-        if tr_step % hparams['patience'] == 0:
-            new_lr = (hparams['learning_rate']
-                      / (hparams['divide_lr_by'] ** (tr_step // hparams['patience'])))
-            print('Reducing Learning rate to: {}'.format(new_lr))
-            for param_group in opt.param_groups:
-                param_group['lr'] = new_lr
+        new_lr = (hparams['learning_rate']
+                  / (hparams['divide_lr_by'] ** (tr_step // hparams['patience'])))
+        if abs(new_lr - opt.param_groups[0]['lr']) > 1e-12:
+            print('Setting Learning rate to: {}'.format(new_lr))
+        for param_group in opt.param_groups:
+            param_group['lr'] = new_lr
     tr_step += 1
 
     # Test evaluation happens only once, after the final epoch: the test
