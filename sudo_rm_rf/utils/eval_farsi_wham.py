@@ -33,6 +33,7 @@ import sys
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 repo_root = os.path.abspath(os.path.join(current_dir, '../..'))
@@ -169,7 +170,8 @@ def main():
                     'SI-SDR', 'SI-SDRi']
 
     all_rows = []
-    for split in splits:
+    n_buckets = len(splits) * hparams['max_num_sources']
+    for bucket_idx, split in enumerate(splits, 1):
         for n_src in range(1, hparams['max_num_sources'] + 1):
             loader = dataset_setup.create_loader_for_simple_dataset(
                 dataset_name='FARSI_WHAM',
@@ -183,8 +185,12 @@ def main():
                                        num_workers=args.n_jobs,
                                        shuffle=False)
             bucket_results = []
-            with torch.no_grad():
-                for data in gen:
+            gen_tqdm = tqdm(gen, total=len(gen), unit='batch',
+                            desc='({}/{}) evaluating {} {}-speaker'
+                                 ''.format(bucket_idx, n_buckets, split,
+                                           n_src))
+            for data in gen_tqdm:
+                with torch.no_grad():
                     mixtures = data['mixture'].to(device)
                     targets = data['targets'][:, :n_src].to(device)
                     # joint normalization: input and references by the
@@ -195,6 +201,8 @@ def main():
                     estimates = model(mixtures)
                     bucket_results += eval_batch(estimates, targets,
                                                  mixtures)
+                gen_tqdm.set_postfix(SISNR='{:.2f}'.format(
+                    np.mean([r['SI-SNR'] for r in bucket_results])))
             row = {'split': split, 'n_src': n_src,
                    'n_samples': len(bucket_results)}
             for metric_name in metric_names:
@@ -204,7 +212,6 @@ def main():
                 row['{}_median'.format(metric_name)] = float(
                     np.median(values))
                 row['{}_std'.format(metric_name)] = float(np.std(values))
-            per_metric_means = {m: row[m] for m in metric_names}
             print('== {} {}-speaker samples: {} =='.format(
                 split, n_src, row['n_samples']))
             for metric_name in metric_names:
